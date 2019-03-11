@@ -1,13 +1,12 @@
 package org.eclipse.jetty.issues;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
-import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
@@ -19,8 +18,10 @@ import org.eclipse.jetty.client.util.InputStreamResponseListener;
 import org.eclipse.jetty.client.util.OutputStreamContentProvider;
 import org.eclipse.jetty.http.HttpStatus;
 import org.eclipse.jetty.server.Server;
-import org.eclipse.jetty.server.handler.DefaultHandler;
+import org.eclipse.jetty.server.handler.AbstractHandler;
 import org.eclipse.jetty.util.HttpCookieStore;
+import org.eclipse.jetty.util.IO;
+import org.eclipse.jetty.util.component.LifeCycle;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 
 public class JettyBug
@@ -44,27 +45,46 @@ public class JettyBug
 
         httpClient.start();
 
-        for (int loop = 1; loop < 100; loop++)
+        try
         {
-            System.out.println("non-deferred iteration " + loop);
 
-            sendRequest(httpClient, false);
+            for (int loop = 1; loop < 100; loop++)
+            {
+                System.out.println("non-deferred iteration " + loop);
+
+                sendRequest(httpClient, false);
+            }
+
+            for (int loop = 1; loop < 100; loop++)
+            {
+                System.out.println("deferred iteration " + loop);
+
+                sendRequest(httpClient, true);
+            }
         }
-
-        for (int loop = 1; loop < 100; loop++)
+        finally
         {
-            System.out.println("deferred iteration " + loop);
-
-            sendRequest(httpClient, true);
+            stop(httpClient);
+            stop(server);
         }
+    }
 
-        server.join();
+    private static void stop(LifeCycle lifeCycle)
+    {
+        try
+        {
+            lifeCycle.stop();
+        }
+        catch (Exception e)
+        {
+            e.printStackTrace();
+        }
     }
 
     private static byte[] createPayloadBytes()
     {
         final byte[] someBytes = new byte[1111];
-        Arrays.fill(someBytes, (byte)1);
+        Arrays.fill(someBytes, (byte) 1);
 
         return someBytes;
     }
@@ -77,11 +97,6 @@ public class JettyBug
         request.idleTimeout(60, TimeUnit.SECONDS);
 
         final byte[] payloadOutBytes = createPayloadBytes();
-        final ByteArrayOutputStream byteOut = new ByteArrayOutputStream();
-        final DataOutputStream dataOut = new DataOutputStream(byteOut);
-        dataOut.writeInt(payloadOutBytes.length);
-        dataOut.write(payloadOutBytes);
-        dataOut.close();
 
         final InputStreamResponseListener listener = new InputStreamResponseListener();
 
@@ -93,12 +108,12 @@ public class JettyBug
 
             try (final OutputStream out = contentProvider.getOutputStream())
             {
-                out.write(byteOut.toByteArray());
+                out.write(payloadOutBytes);
             }
         }
         else
         {
-            final BytesContentProvider content = new BytesContentProvider(byteOut.toByteArray());
+            final BytesContentProvider content = new BytesContentProvider(payloadOutBytes);
             request.content(content);
             request.send(listener);
         }
@@ -110,44 +125,34 @@ public class JettyBug
             throw new IOException("Status=" + response.getStatus());
         }
 
-        final DataInputStream dataIn = new DataInputStream(listener.getInputStream());
-        final int size = dataIn.readInt();
-        final byte[] payloadInBytes = new byte[size];
-        dataIn.readFully(payloadInBytes);
-        dataIn.close();
-
-        if (!Arrays.equals(payloadOutBytes, payloadInBytes))
+        try (ByteArrayOutputStream result = new ByteArrayOutputStream();
+             InputStream in = listener.getInputStream())
         {
-            throw new IllegalStateException("Payload bytes not identical");
+            IO.copy(in, result);
+            if (!Arrays.equals(payloadOutBytes, result.toByteArray()))
+            {
+                throw new IllegalStateException("Payload bytes not identical");
+            }
         }
+        System.out.println("Finished");
     }
 
-    public static class MyHandler extends DefaultHandler
+    public static class MyHandler extends AbstractHandler
     {
-        protected MyHandler()
-        {
-        }
-
         @Override
         public final void handle(final String target,
                                  final org.eclipse.jetty.server.Request request,
                                  final HttpServletRequest servletRequest,
-                                 final HttpServletResponse servletResponse) throws IOException, ServletException
+                                 final HttpServletResponse servletResponse) throws IOException
         {
-            final DataInputStream dataIn = new DataInputStream(servletRequest.getInputStream());
-            final int size = dataIn.readInt();
-            final byte[] bytes = new byte[size];
-
-            dataIn.readFully(bytes);
-            dataIn.close();
-
-            final DataOutputStream dataOut = new DataOutputStream(servletResponse.getOutputStream());
-            dataOut.writeInt(bytes.length);
-            dataOut.write(bytes);
-
+            System.out.printf("handle(): Content-Length: %,d / Transfer-Encoding: %s%n", servletRequest.getContentLength(), servletRequest.getHeader("Transfer-Encoding"));
+            ByteArrayOutputStream reqbytes = new ByteArrayOutputStream();
+            IO.copy(servletRequest.getInputStream(), reqbytes);
+            System.out.printf("read %,d bytes%n", reqbytes.toByteArray().length);
+            ByteArrayInputStream respbytes = new ByteArrayInputStream(reqbytes.toByteArray());
+            IO.copy(respbytes, servletResponse.getOutputStream());
             servletResponse.setStatus(HttpStatus.OK_200);
             request.setHandled(true);
-
         }
     }
 }
